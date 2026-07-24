@@ -285,6 +285,7 @@ export default function BrokerDesk() {
   });
   const [visualReady, setVisualReady] = useState(false);
   const [shareVisual, setShareVisual] = useState(false);
+  const [agentVisionLive, setAgentVisionLive] = useState(false);
   const [notice, setNotice] = useState("");
   const [activeTab, setActiveTab] = useState<ActiveTab>("home");
   const [intelligenceQuery, setIntelligenceQuery] = useState(
@@ -301,6 +302,7 @@ export default function BrokerDesk() {
   const visualTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const participantIdRef = useRef<string | null>(null);
   const shareVisualRef = useRef(false);
+  const agentVisionLiveRef = useRef(false);
   const sceneKindRef = useRef<"none" | "real" | "synthetic">("none");
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const participantDraftRef = useRef("");
@@ -553,16 +555,46 @@ export default function BrokerDesk() {
     }
   }
 
+  const sendCurrentVisualFrame = useCallback(() => {
+    if (!shareVisualRef.current || !sessionRef.current) return false;
+    const frame = panoramaRef.current?.captureFrame();
+    if (!frame) return false;
+    sessionRef.current.sendRealtimeInput({
+      video: { data: frame.data, mimeType: frame.mimeType },
+    });
+    if (!agentVisionLiveRef.current) {
+      agentVisionLiveRef.current = true;
+      setAgentVisionLive(true);
+    }
+    return true;
+  }, []);
+
+  const handlePanoramaAvailability = useCallback(
+    (available: boolean) => {
+      setVisualReady(available);
+      if (!available) {
+        agentVisionLiveRef.current = false;
+        setAgentVisionLive(false);
+        return;
+      }
+      sendCurrentVisualFrame();
+    },
+    [sendCurrentVisualFrame],
+  );
+
+  const handleSceneKindChange = useCallback(
+    (kind: "none" | "real" | "synthetic") => {
+      sceneKindRef.current = kind;
+      agentVisionLiveRef.current = false;
+      setAgentVisionLive(false);
+    },
+    [],
+  );
+
   function startVisualFrames() {
     if (visualTimerRef.current) clearInterval(visualTimerRef.current);
-    visualTimerRef.current = setInterval(() => {
-      if (!shareVisualRef.current || !sessionRef.current) return;
-      const frame = panoramaRef.current?.captureFrame();
-      if (!frame) return;
-      sessionRef.current.sendRealtimeInput({
-        video: { data: frame.data, mimeType: frame.mimeType },
-      });
-    }, 1000);
+    sendCurrentVisualFrame();
+    visualTimerRef.current = setInterval(sendCurrentVisualFrame, 1000);
   }
 
   async function startInterview() {
@@ -571,6 +603,10 @@ export default function BrokerDesk() {
     setNotice("");
     setAudioHealth({ microphone: false, output: false, level: 0 });
     audioOutputReceivedRef.current = false;
+    setShareVisual(true);
+    shareVisualRef.current = true;
+    setAgentVisionLive(false);
+    agentVisionLiveRef.current = false;
 
     audioRef.current?.close();
     const audio = new LiveAudio();
@@ -583,6 +619,8 @@ export default function BrokerDesk() {
     } catch (error) {
       audio.close();
       audioRef.current = null;
+      setShareVisual(false);
+      shareVisualRef.current = false;
       setLiveState("error");
       setLiveError(
         error instanceof Error ? error.message : "Could not enable browser audio.",
@@ -673,13 +711,19 @@ export default function BrokerDesk() {
       setLiveState("listening");
       startVisualFrames();
       session.sendRealtimeInput({
-        text: `Begin the ${role} intake now. Briefly introduce yourself as Relay, explain that you will save only what they explicitly tell you, then ask the first question.`,
+        text: `Begin the ${role} intake now. Briefly introduce yourself as Relay, explain that you will save only what they explicitly tell you, then ask the first question. A live inspection frame is shared automatically when available. If you can see it, briefly confirm one concrete, non-diagnostic detail from the apiary scene.`,
       });
     } catch (error) {
       audio.close();
       audioRef.current = null;
       sessionRef.current?.close();
       sessionRef.current = null;
+      if (visualTimerRef.current) clearInterval(visualTimerRef.current);
+      visualTimerRef.current = null;
+      setShareVisual(false);
+      shareVisualRef.current = false;
+      setAgentVisionLive(false);
+      agentVisionLiveRef.current = false;
       setLiveState("error");
       setLiveError(
         error instanceof Error ? error.message : "Could not start the interview.",
@@ -698,6 +742,10 @@ export default function BrokerDesk() {
       microphone: false,
       level: 0,
     }));
+    setShareVisual(false);
+    shareVisualRef.current = false;
+    setAgentVisionLive(false);
+    agentVisionLiveRef.current = false;
     sessionRef.current?.sendRealtimeInput({ audioStreamEnd: true });
     window.setTimeout(() => {
       sessionRef.current?.close();
@@ -853,11 +901,8 @@ export default function BrokerDesk() {
         <section className="inspection-room">
           <PanoramaInspector
             ref={panoramaRef}
-            onAvailabilityChange={setVisualReady}
-            onSceneKindChange={(kind) => {
-              sceneKindRef.current = kind;
-              setShareVisual(false);
-            }}
+            onAvailabilityChange={handlePanoramaAvailability}
+            onSceneKindChange={handleSceneKindChange}
           />
 
           <div className="inspection-title">
@@ -897,11 +942,28 @@ export default function BrokerDesk() {
                 </button>
               ))}
               <button
-                className={`share-scene ${shareVisual ? "selected" : ""}`}
+                className={`share-scene ${agentVisionLive ? "selected" : ""}`}
                 disabled={!visualReady || !live}
-                onClick={() => setShareVisual((value) => !value)}
+                onClick={() => {
+                  const next = !shareVisualRef.current;
+                  shareVisualRef.current = next;
+                  setShareVisual(next);
+                  if (next) {
+                    sendCurrentVisualFrame();
+                  } else {
+                    agentVisionLiveRef.current = false;
+                    setAgentVisionLive(false);
+                  }
+                }}
               >
-                <Eye size={15} /> {shareVisual ? "Scene shared" : "Share scene"}
+                <Eye size={15} />
+                {agentVisionLive
+                  ? "Agent sees scene"
+                  : shareVisual
+                    ? "Connecting scene…"
+                    : live
+                      ? "Share scene"
+                      : "Auto-share on start"}
               </button>
             </div>
 

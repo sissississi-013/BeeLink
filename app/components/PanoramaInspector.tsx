@@ -2,6 +2,7 @@
 
 import {
   forwardRef,
+  memo,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -25,7 +26,7 @@ type ViewMode = "panorama" | "camera";
 
 const DEMO_PANORAMA = "/demo-apiary-panorama-v2.png";
 
-export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
+export const PanoramaInspector = memo(forwardRef<PanoramaHandle, Props>(
   function PanoramaInspector(
     { onAvailabilityChange, onSceneKindChange },
     ref,
@@ -35,15 +36,34 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
     const viewerRef = useRef<Pannellum.Viewer | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const objectUrlRef = useRef<string | null>(null);
+    const loadRequestRef = useRef(0);
+    const availabilityCallbackRef = useRef(onAvailabilityChange);
+    const sceneKindCallbackRef = useRef(onSceneKindChange);
     const [mode, setMode] = useState<ViewMode>("panorama");
     const [loading, setLoading] = useState(true);
     const [cameraError, setCameraError] = useState("");
     const [sceneLabel, setSceneLabel] = useState("Synthetic demo panorama");
 
+    useEffect(() => {
+      availabilityCallbackRef.current = onAvailabilityChange;
+      sceneKindCallbackRef.current = onSceneKindChange;
+    }, [onAvailabilityChange, onSceneKindChange]);
+
     const stopCamera = useCallback(() => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       if (videoRef.current) videoRef.current.srcObject = null;
+    }, []);
+
+    const destroyViewer = useCallback(() => {
+      const viewer = viewerRef.current;
+      viewerRef.current = null;
+      if (!viewer) return;
+      try {
+        viewer.destroy();
+      } catch {
+        // Pannellum may already have released its WebGL surface.
+      }
     }, []);
 
     const loadPanorama = useCallback(
@@ -52,18 +72,19 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
         kind: "real" | "synthetic",
         label: string,
       ) => {
+        const requestId = ++loadRequestRef.current;
         stopCamera();
         setMode("panorama");
         setLoading(true);
         setCameraError("");
         setSceneLabel(label);
-        onAvailabilityChange?.(false);
-        onSceneKindChange?.(kind);
-        viewerRef.current?.destroy();
+        availabilityCallbackRef.current?.(false);
+        sceneKindCallbackRef.current?.(kind);
+        destroyViewer();
         await import("pannellum");
-        if (!containerRef.current) return;
+        if (loadRequestRef.current !== requestId || !containerRef.current) return;
 
-        viewerRef.current = window.pannellum.viewer(containerRef.current, {
+        const viewer = window.pannellum.viewer(containerRef.current, {
           type: "equirectangular",
           panorama: source,
           autoLoad: true,
@@ -99,16 +120,19 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
                 ]
               : [],
         });
-        viewerRef.current.on("load", () => {
+        viewerRef.current = viewer;
+        viewer.on("load", () => {
+          if (loadRequestRef.current !== requestId) return;
           setLoading(false);
-          onAvailabilityChange?.(true);
+          availabilityCallbackRef.current?.(true);
         });
-        viewerRef.current.on("error", () => {
+        viewer.on("error", () => {
+          if (loadRequestRef.current !== requestId) return;
           setLoading(false);
-          onAvailabilityChange?.(false);
+          availabilityCallbackRef.current?.(false);
         });
       },
-      [onAvailabilityChange, onSceneKindChange, stopCamera],
+      [destroyViewer, stopCamera],
     );
 
     const loadDemo = useCallback(() => {
@@ -122,11 +146,12 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
     useEffect(() => {
       void loadDemo();
       return () => {
-        viewerRef.current?.destroy();
+        loadRequestRef.current += 1;
+        destroyViewer();
         stopCamera();
         if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       };
-    }, [loadDemo, stopCamera]);
+    }, [destroyViewer, loadDemo, stopCamera]);
 
     async function startCamera() {
       setCameraError("");
@@ -142,18 +167,19 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
             height: { ideal: 1080 },
           },
         });
-        viewerRef.current?.destroy();
-        viewerRef.current = null;
+        loadRequestRef.current += 1;
+        destroyViewer();
         streamRef.current = stream;
         setMode("camera");
+        setLoading(false);
         setSceneLabel("Live surrounding camera");
-        onSceneKindChange?.("real");
+        sceneKindCallbackRef.current?.("real");
         requestAnimationFrame(() => {
           if (!videoRef.current) return;
           videoRef.current.srcObject = stream;
           void videoRef.current.play();
         });
-        onAvailabilityChange?.(true);
+        availabilityCallbackRef.current?.(true);
       } catch (error) {
         setCameraError(
           error instanceof Error ? error.message : "Could not open the camera.",
@@ -257,4 +283,4 @@ export const PanoramaInspector = forwardRef<PanoramaHandle, Props>(
       </section>
     );
   },
-);
+));

@@ -1909,12 +1909,28 @@ button.brand {
 }
 
 .panorama-stage {
-  background: #111914;
+  background:
+    #111914 url("/demo-apiary-panorama-v2.png") center / cover no-repeat;
   height: 100%;
   inset: 0;
   overflow: hidden;
   position: absolute;
   width: 100%;
+}
+
+.panorama-stage .pnlm-container {
+  background:
+    #111914 url("/demo-apiary-panorama-v2.png") center / cover no-repeat;
+}
+
+.panorama-stage .pnlm-load-box,
+.panorama-stage .pnlm-loading {
+  display: none !important;
+}
+
+.panorama-stage .pnlm-render-container {
+  transform: translateZ(0);
+  will-change: transform;
 }
 
 .panorama-stage::after {
