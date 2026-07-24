@@ -20,20 +20,37 @@ export class LiveAudio {
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
   private worklet: AudioWorkletNode | null = null;
+  private workletLoaded = false;
   private scheduled: AudioBufferSourceNode[] = [];
   private nextStartTime = 0;
+  private captureBuffer = new Float32Array(1600);
+  private captureOffset = 0;
+  private captureSumSquares = 0;
 
-  private async ensureContext() {
+  async prepare() {
     if (!this.context) {
-      this.context = new AudioContext();
-      await this.context.audioWorklet.addModule("/pcm-processor.js");
+      this.context = new AudioContext({ latencyHint: "interactive" });
     }
-    if (this.context.state === "suspended") await this.context.resume();
+    if (this.context.state === "suspended") {
+      await this.context.resume();
+    }
+    if (this.context.state !== "running") {
+      throw new Error(
+        "Browser audio is paused. Click Start interview again to enable the microphone and speaker.",
+      );
+    }
+    if (!this.workletLoaded) {
+      await this.context.audioWorklet.addModule("/pcm-processor.js");
+      this.workletLoaded = true;
+    }
     return this.context;
   }
 
-  async startCapture(onPcm: (pcm: ArrayBuffer) => void) {
-    const context = await this.ensureContext();
+  async startCapture(
+    onPcm: (pcm: ArrayBuffer) => void,
+    onLevel?: (level: number) => void,
+  ) {
+    const context = await this.prepare();
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -45,7 +62,23 @@ export class LiveAudio {
     this.worklet = new AudioWorkletNode(context, "pcm-processor");
     this.worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
       const downsampled = this.downsample(event.data, context.sampleRate, 16000);
-      onPcm(this.floatToInt16(downsampled));
+      for (const sample of downsampled) {
+        this.captureSumSquares += sample * sample;
+        this.captureBuffer[this.captureOffset] = sample;
+        this.captureOffset += 1;
+        if (this.captureOffset === this.captureBuffer.length) {
+          onLevel?.(
+            Math.min(
+              1,
+              Math.sqrt(this.captureSumSquares / this.captureBuffer.length) * 5,
+            ),
+          );
+          onPcm(this.floatToInt16(this.captureBuffer));
+          this.captureBuffer = new Float32Array(1600);
+          this.captureOffset = 0;
+          this.captureSumSquares = 0;
+        }
+      }
     };
     const silence = context.createGain();
     silence.gain.value = 0;
@@ -59,16 +92,26 @@ export class LiveAudio {
     this.stream = null;
     this.worklet?.disconnect();
     this.worklet = null;
+    this.captureBuffer = new Float32Array(1600);
+    this.captureOffset = 0;
+    this.captureSumSquares = 0;
   }
 
-  async playBase64Pcm(base64: string) {
-    const context = await this.ensureContext();
+  async playBase64Pcm(base64: string, mimeType = "audio/pcm;rate=24000") {
+    const context = await this.prepare();
     const pcm = new Int16Array(base64ToArrayBuffer(base64));
+    if (!pcm.length) return;
     const floats = new Float32Array(pcm.length);
     for (let index = 0; index < pcm.length; index += 1) {
       floats[index] = pcm[index] / 32768;
     }
-    const buffer = context.createBuffer(1, floats.length, 24000);
+    const sampleRateMatch = /rate=(\d+)/i.exec(mimeType);
+    const sampleRate = Number(sampleRateMatch?.[1] ?? 24000);
+    const buffer = context.createBuffer(
+      1,
+      floats.length,
+      Number.isFinite(sampleRate) ? sampleRate : 24000,
+    );
     buffer.getChannelData(0).set(floats);
     const source = context.createBufferSource();
     source.buffer = buffer;
@@ -99,6 +142,7 @@ export class LiveAudio {
     this.stopPlayback();
     void this.context?.close();
     this.context = null;
+    this.workletLoaded = false;
   }
 
   private downsample(input: Float32Array, inputRate: number, outputRate: number) {

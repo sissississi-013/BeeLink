@@ -2194,6 +2194,53 @@ button.brand {
   margin-left: auto;
 }
 
+.duplex-health {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: 1fr 1fr;
+  padding: 8px 12px 0;
+}
+
+.duplex-health > span {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  color: rgba(255, 255, 255, 0.42);
+  display: flex;
+  font-size: 9px;
+  font-weight: 750;
+  gap: 5px;
+  min-height: 27px;
+  padding: 0 7px;
+}
+
+.duplex-health > span.healthy {
+  background: rgba(82, 190, 119, 0.1);
+  border-color: rgba(115, 225, 151, 0.25);
+  color: #a5e9bb;
+}
+
+.duplex-health i {
+  background: rgba(255, 255, 255, 0.1);
+  height: 3px;
+  margin-left: auto;
+  overflow: hidden;
+  position: relative;
+  width: 28px;
+}
+
+.duplex-health i::after {
+  background: #7bdd9b;
+  content: "";
+  height: 100%;
+  left: 0;
+  position: absolute;
+  top: 0;
+  transition: width 90ms linear;
+  width: var(--mic-level, 8%);
+}
+
 .floating-transcript {
   max-height: min(280px, 35vh);
   min-height: 112px;

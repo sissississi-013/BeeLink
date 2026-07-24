@@ -30,6 +30,7 @@ import {
   ShieldCheck,
   Sprout,
   Users,
+  Volume2,
   Waves,
   X,
 } from "lucide-react";
@@ -60,6 +61,23 @@ type IntelligenceResult = {
   publishedAt: string | null;
   crawledAt: string | null;
 };
+
+function getLiveAudioChunks(message: LiveServerMessage) {
+  const chunks: Array<{ data: string; mimeType: string }> = [];
+  for (const part of message.serverContent?.modelTurn?.parts ?? []) {
+    const inlineData = part.inlineData;
+    if (
+      inlineData?.data &&
+      (inlineData.mimeType?.startsWith("audio/pcm") ?? true)
+    ) {
+      chunks.push({
+        data: inlineData.data,
+        mimeType: inlineData.mimeType || "audio/pcm;rate=24000",
+      });
+    }
+  }
+  return chunks;
+}
 
 const PROFILE_LABELS: Record<string, string> = {
   displayName: "Contact",
@@ -255,6 +273,11 @@ export default function BrokerDesk() {
   const [role, setRole] = useState<ParticipantRole>("beekeeper");
   const [liveState, setLiveState] = useState<LiveState>("idle");
   const [liveError, setLiveError] = useState("");
+  const [audioHealth, setAudioHealth] = useState({
+    microphone: false,
+    output: false,
+    level: 0,
+  });
   const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
   const [liveDraft, setLiveDraft] = useState({
     participant: "",
@@ -282,6 +305,7 @@ export default function BrokerDesk() {
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const participantDraftRef = useRef("");
   const agentDraftRef = useRef("");
+  const audioOutputReceivedRef = useRef(false);
 
   const selected = participants.find((participant) => participant.id === selectedId) ?? null;
   const matches = useMemo(() => computeMatches(participants), [participants]);
@@ -459,7 +483,21 @@ export default function BrokerDesk() {
       audioRef.current?.stopPlayback();
       await flushTranscriptTurn();
     }
-    if (message.data) void audioRef.current?.playBase64Pcm(message.data);
+    for (const chunk of getLiveAudioChunks(message)) {
+      if (!audioOutputReceivedRef.current) {
+        audioOutputReceivedRef.current = true;
+        setAudioHealth((current) => ({ ...current, output: true }));
+      }
+      void audioRef.current
+        ?.playBase64Pcm(chunk.data, chunk.mimeType)
+        .catch((error: unknown) => {
+          setLiveError(
+            error instanceof Error
+              ? error.message
+              : "Relay sent audio, but the browser could not play it.",
+          );
+        });
+    }
 
     const participantText = message.serverContent?.inputTranscription?.text;
     if (participantText) {
@@ -531,6 +569,27 @@ export default function BrokerDesk() {
     setLiveState("connecting");
     setLiveError("");
     setNotice("");
+    setAudioHealth({ microphone: false, output: false, level: 0 });
+    audioOutputReceivedRef.current = false;
+
+    audioRef.current?.close();
+    const audio = new LiveAudio();
+    audioRef.current = audio;
+    try {
+      // Create and resume Web Audio during the click gesture. Waiting until
+      // after token/session requests can leave both capture and playback
+      // suspended by browser autoplay policy.
+      await audio.prepare();
+    } catch (error) {
+      audio.close();
+      audioRef.current = null;
+      setLiveState("error");
+      setLiveError(
+        error instanceof Error ? error.message : "Could not enable browser audio.",
+      );
+      return;
+    }
+
     const participantId = crypto.randomUUID();
     participantIdRef.current = participantId;
     setSelectedId(participantId);
@@ -558,17 +617,21 @@ export default function BrokerDesk() {
         apiKey: tokenData.token,
         apiVersion: "v1beta",
       });
-      audioRef.current = new LiveAudio();
       const session = await ai.live.connect({
         model: tokenData.model,
         callbacks: {
-          onopen: () => setLiveState("listening"),
+          onopen: () => setNotice("Secure voice channel connected."),
           onmessage: (message) => void handleLiveMessage(message),
           onerror: (event) => {
             setLiveError(event.message || "The live interview encountered an error.");
             setLiveState("error");
           },
           onclose: () => {
+            setAudioHealth((current) => ({
+              ...current,
+              microphone: false,
+              level: 0,
+            }));
             setLiveState((current) => (current === "ending" ? "idle" : current));
           },
         },
@@ -592,20 +655,29 @@ export default function BrokerDesk() {
         },
       });
       sessionRef.current = session;
-      await audioRef.current.startCapture((pcm) => {
+      await audio.startCapture((pcm) => {
         sessionRef.current?.sendRealtimeInput({
           audio: {
             data: arrayBufferToBase64(pcm),
             mimeType: "audio/pcm;rate=16000",
           },
         });
+      }, (level) => {
+        setAudioHealth((current) => ({
+          ...current,
+          microphone: true,
+          level,
+        }));
       });
+      setAudioHealth((current) => ({ ...current, microphone: true }));
+      setLiveState("listening");
       startVisualFrames();
       session.sendRealtimeInput({
         text: `Begin the ${role} intake now. Briefly introduce yourself as Relay, explain that you will save only what they explicitly tell you, then ask the first question.`,
       });
     } catch (error) {
-      audioRef.current?.close();
+      audio.close();
+      audioRef.current = null;
       sessionRef.current?.close();
       sessionRef.current = null;
       setLiveState("error");
@@ -621,12 +693,18 @@ export default function BrokerDesk() {
     if (visualTimerRef.current) clearInterval(visualTimerRef.current);
     visualTimerRef.current = null;
     audioRef.current?.stopCapture();
+    setAudioHealth((current) => ({
+      ...current,
+      microphone: false,
+      level: 0,
+    }));
     sessionRef.current?.sendRealtimeInput({ audioStreamEnd: true });
     window.setTimeout(() => {
       sessionRef.current?.close();
       sessionRef.current = null;
       audioRef.current?.close();
       audioRef.current = null;
+      setAudioHealth({ microphone: false, output: false, level: 0 });
       setLiveState("idle");
       void loadData();
     }, 400);
@@ -795,9 +873,11 @@ export default function BrokerDesk() {
                 <strong>Relay · live broker</strong>
                 <small>
                   {liveState === "connecting"
-                    ? "Opening voice channel…"
+                    ? "Enabling microphone + speaker…"
                     : live
-                      ? "Listening · one live sentence"
+                      ? audioHealth.output
+                        ? "Two-way voice connected"
+                        : "Microphone live · waiting for Relay"
                       : "Ready for voice intake"}
                 </small>
               </span>
@@ -825,13 +905,30 @@ export default function BrokerDesk() {
               </button>
             </div>
 
+            <div className="duplex-health" aria-label="Live audio status">
+              <span className={audioHealth.microphone ? "healthy" : ""}>
+                <Mic size={13} />
+                {audioHealth.microphone ? "Mic active" : "Mic waiting"}
+                <i
+                  aria-hidden="true"
+                  style={{
+                    "--mic-level": `${Math.max(8, audioHealth.level * 100)}%`,
+                  } as React.CSSProperties}
+                />
+              </span>
+              <span className={audioHealth.output ? "healthy" : ""}>
+                <Volume2 size={13} />
+                {audioHealth.output ? "Relay audio received" : "Relay audio waiting"}
+              </span>
+            </div>
+
             <div className="floating-transcript">
               {!transcript.length && !liveDraft.participant && !liveDraft.agent ? (
                 <div className="compact-empty">
                   <Headphones size={23} />
                   <span>
-                    No form. Relay asks one question at a time and saves complete
-                    turns—not word fragments.
+                    Start the interview to speak naturally. Relay will answer
+                    aloud and save complete turns—not word fragments.
                   </span>
                 </div>
               ) : (
