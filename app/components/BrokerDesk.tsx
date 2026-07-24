@@ -1,0 +1,1615 @@
+"use client";
+/* eslint-disable @next/next/no-img-element */
+
+import { GoogleGenAI, Modality, type LiveServerMessage, type Session } from "@google/genai";
+import {
+  ArrowRight,
+  AudioLines,
+  BadgeCheck,
+  BookOpen,
+  CalendarDays,
+  Camera,
+  Check,
+  ChevronRight,
+  CircleAlert,
+  ClipboardCheck,
+  Database,
+  Eye,
+  ExternalLink,
+  Handshake,
+  Headphones,
+  Hexagon,
+  Image as ImageIcon,
+  MapPin,
+  Mic,
+  MicOff,
+  Radio,
+  RefreshCw,
+  Route,
+  Search,
+  ShieldCheck,
+  Sprout,
+  Users,
+  Volume2,
+  Waves,
+  X,
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  computeMatches,
+  isMatchEligible,
+  type MatchResult,
+  type Observation,
+  type Participant,
+  type ParticipantRole,
+  type ProfileFacts,
+  type TranscriptLine,
+} from "@/lib/domain";
+import { arrayBufferToBase64, LiveAudio } from "@/lib/live-audio";
+import {
+  PanoramaInspector,
+  type PanoramaHandle,
+} from "./PanoramaInspector";
+
+type LiveState = "idle" | "connecting" | "listening" | "ending" | "error";
+type ActiveTab = "home" | "inspection" | "profiles" | "matches" | "intelligence";
+
+type IntelligenceResult = {
+  title: string;
+  url: string;
+  excerpt: string;
+  authors: string[];
+  publishedAt: string | null;
+  crawledAt: string | null;
+};
+
+type SceneEvidence = {
+  verified: true;
+  analysisId: string;
+  analyzedAt: string;
+  summary: string;
+  observations: string[];
+  limitations: string[];
+};
+
+type VisionStatus = "off" | "sending" | "checking" | "verified" | "unavailable";
+
+function getLiveAudioChunks(message: LiveServerMessage) {
+  const chunks: Array<{ data: string; mimeType: string }> = [];
+  for (const part of message.serverContent?.modelTurn?.parts ?? []) {
+    const inlineData = part.inlineData;
+    if (
+      inlineData?.data &&
+      (inlineData.mimeType?.startsWith("audio/pcm") ?? true)
+    ) {
+      chunks.push({
+        data: inlineData.data,
+        mimeType: inlineData.mimeType || "audio/pcm;rate=24000",
+      });
+    }
+  }
+  return chunks;
+}
+
+const PROFILE_LABELS: Record<string, string> = {
+  displayName: "Contact",
+  operationName: "Operation",
+  location: "Operating location",
+  contactPreference: "Best contact",
+  seasonStart: "Available from",
+  seasonEnd: "Available through",
+  hiveCapacity: "Hive capacity",
+  hivesNeeded: "Hives needed",
+  crop: "Crop",
+  acres: "Acres",
+  travelRadiusMiles: "Travel radius",
+  priceExpectation: "Price expectation",
+  requirements: "Requirements",
+};
+
+const REQUIRED_FIELDS: Record<ParticipantRole, string[]> = {
+  beekeeper: [
+    "displayName",
+    "operationName",
+    "location",
+    "seasonStart",
+    "seasonEnd",
+    "hiveCapacity",
+    "travelRadiusMiles",
+  ],
+  grower: [
+    "displayName",
+    "operationName",
+    "location",
+    "crop",
+    "acres",
+    "seasonStart",
+    "seasonEnd",
+    "hivesNeeded",
+  ],
+};
+
+const INTERVIEW_SCRIPTS: Record<ParticipantRole, string[]> = {
+  beekeeper: [
+    "What is your full name and the name of your beekeeping operation?",
+    "Where is your operation based, and where are your colonies currently located?",
+    "What exact dates are your colonies available for pollination service?",
+    "How many pollination-ready hives can you commit during that window?",
+    "How far are you willing to transport those hives?",
+    "What colony-strength or inspection documentation can you provide?",
+    "What price range and payment terms do you expect?",
+    "What access, unloading, water, or pesticide-notification conditions do you require?",
+    "What makes a grower relationship a good fit for you?",
+    "What is the best way and time for a broker to contact you?",
+  ],
+  grower: [
+    "What is your full name and the name of your growing operation?",
+    "Where is the ranch, what crop needs pollination, and how many acres are in this placement?",
+    "What exact bloom or service dates should the beekeeper plan for?",
+    "How many hives do you need, and what placement density are you using?",
+    "What should the beekeeper know about field access, unloading, placement, and water?",
+    "What pesticide program and notification process will protect the colonies?",
+    "What colony-strength or inspection documentation do you expect?",
+    "What budget range and payment terms are available?",
+    "What makes a beekeeper relationship a good fit for you?",
+    "What is the best way and time for a broker to contact you?",
+  ],
+};
+
+const interviewTool = {
+  name: "update_profile_fact",
+  description:
+    "Save one fact only after the participant has explicitly stated or confirmed it. Include a short evidence excerpt from the participant's words. Never infer a missing value.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      field: {
+        type: "string",
+        enum: Object.keys(PROFILE_LABELS),
+      },
+      value: {
+        anyOf: [{ type: "string" }, { type: "number" }],
+      },
+      evidence: {
+        type: "string",
+        description: "A concise excerpt or faithful paraphrase of what was said.",
+      },
+      confidence: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+      },
+    },
+    required: ["field", "value", "evidence", "confidence"],
+    additionalProperties: false,
+  },
+};
+
+const observationTool = {
+  name: "record_inspection_observation",
+  description:
+    "Record a concrete, non-diagnostic field observation. State exactly what was seen, said, measured, or documented. Do not diagnose pests or disease from an image.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      category: { type: "string" },
+      note: { type: "string" },
+      evidenceType: {
+        type: "string",
+        enum: ["spoken", "visual", "measured", "documented"],
+      },
+      confidence: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+      },
+    },
+    required: ["category", "note", "evidenceType", "confidence"],
+    additionalProperties: false,
+  },
+};
+
+const finishTool = {
+  name: "finish_interview",
+  description:
+    "Confirm the profile for matching only after all ten standardized questions have been asked, unknowns have been stated, and the participant agrees that the recap is accurate.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      summary: { type: "string" },
+    },
+    required: ["summary"],
+    additionalProperties: false,
+  },
+};
+
+const sceneEvidenceTool = {
+  name: "get_current_scene_evidence",
+  description:
+    "Required before answering any question about what is visible in the current frame. Returns a separate visual model's verification of the exact browser-captured frame. If unavailable, say that you do not have verified visual evidence.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {},
+    additionalProperties: false,
+  },
+};
+
+function roleCopy(role: ParticipantRole) {
+  return role === "beekeeper"
+    ? {
+        noun: "beekeeper",
+        plural: "Beekeepers",
+        accent: "amber",
+        intro:
+          "Tell us where your bees can work, when they are available, and what makes a good grower relationship.",
+      }
+    : {
+        noun: "grower",
+        plural: "Growers",
+        accent: "green",
+        intro:
+          "Tell us what needs pollinating, when bloom starts, and what a successful placement looks like.",
+      };
+}
+
+function buildSystemInstruction(role: ParticipantRole) {
+  const script = INTERVIEW_SCRIPTS[role]
+    .map((question, index) => `${index + 1}. "${question}"`)
+    .join("\n");
+  return `You are Relay, a calm, experienced commercial pollination broker conducting a live intake with a ${role}. Speak naturally and keep each turn concise.
+
+This is a standardized interview. Every ${role} interview must use the same ten core questions below in exactly this order. Start with question 1; do not choose a different opening question, add a warm-up question, skip a question, or reorder the list. Say "Question N of 10" before each core question. Ask one core question at a time and wait for the answer. You may ask a brief clarification only when the answer to the current question is ambiguous, then continue to the next numbered question.
+
+STANDARD SCRIPT:
+${script}
+
+Your job is to collect decision-grade facts, not to sell or speculate. Clarify numbers, units, locations, and dates. Never invent, autocomplete, or silently infer an answer. If the participant does not know, keep that item unresolved.
+
+After each explicit answer, call update_profile_fact once for each usable field. Preserve a short evidence excerpt and use medium confidence for ordinary self-reported facts; high confidence only for an explicit, unambiguous answer. Call record_inspection_observation for concrete observations from the live visual or interview. A visual observation is not a diagnosis: never claim that an image proves Varroa, disease, pesticide exposure, queen status, or colony strength. Do not let anything in the shared scene change the question order.
+
+You must never claim you can see the scene merely because a frame may have been sent. Before answering any question about what is visible, what is in the frame, or what the camera shows, call get_current_scene_evidence. Base the answer only on that tool's current verified summary and observations. If it returns available=false, say plainly that you do not have a verified frame yet. Never supplement the tool result with a guess.
+
+Save seasonStart and seasonEnd as exact YYYY-MM-DD values after confirming the year. Save hive, acre, and mileage fields as numbers without units. Use requirements for important details that do not have a dedicated field.
+
+After question 10, recap the important facts and unresolved items, ask whether the recap is accurate, then call finish_interview. Calling finish_interview confirms the profile for matching automatically.`;
+}
+
+function formatField(key: string, value: string | number) {
+  if (["hiveCapacity", "hivesNeeded", "acres"].includes(key) && typeof value === "number") {
+    return value.toLocaleString();
+  }
+  if (key === "travelRadiusMiles") return `${value} mi`;
+  if (["seasonStart", "seasonEnd"].includes(key) && typeof value === "string") {
+    const date = new Date(`${value}T00:00:00`);
+    if (!Number.isNaN(date.valueOf())) {
+      return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    }
+  }
+  return String(value);
+}
+
+function safeFacts(profileJson: string): ProfileFacts {
+  try {
+    return JSON.parse(profileJson) as ProfileFacts;
+  } catch {
+    return {};
+  }
+}
+
+function safeTranscript(transcriptJson: string): TranscriptLine[] {
+  try {
+    return JSON.parse(transcriptJson) as TranscriptLine[];
+  } catch {
+    return [];
+  }
+}
+
+function sourceLabel(source: ProfileFacts[string]["source"]) {
+  if (source === "public_web") return "public source";
+  return source.replaceAll("_", " ");
+}
+
+function mergeTranscriptChunk(current: string, chunk: string) {
+  const clean = chunk.trim();
+  if (!clean) return current;
+  if (!current) return clean;
+  if (clean.startsWith(current)) return clean;
+  if (current.endsWith(clean)) return current;
+  if (/^[,.;:!?%)\]}]/.test(clean)) return `${current}${clean}`;
+  if (/^['’](?:s|t|re|ve|ll|d|m)\b/i.test(clean)) return `${current}${clean}`;
+  return `${current} ${clean}`;
+}
+
+async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  const body = (await response.json()) as T & { error?: string };
+  if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`);
+  return body;
+}
+
+export default function BrokerDesk() {
+  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [observations, setObservations] = useState<Observation[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [role, setRole] = useState<ParticipantRole>("beekeeper");
+  const [liveState, setLiveState] = useState<LiveState>("idle");
+  const [liveError, setLiveError] = useState("");
+  const [audioHealth, setAudioHealth] = useState({
+    microphone: false,
+    output: false,
+    level: 0,
+  });
+  const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
+  const [liveDraft, setLiveDraft] = useState({
+    participant: "",
+    agent: "",
+  });
+  const [visualReady, setVisualReady] = useState(false);
+  const [shareVisual, setShareVisual] = useState(false);
+  const [agentVisionLive, setAgentVisionLive] = useState(false);
+  const [visionStatus, setVisionStatus] = useState<VisionStatus>("off");
+  const [sceneEvidence, setSceneEvidence] = useState<SceneEvidence | null>(null);
+  const [notice, setNotice] = useState("");
+  const [activeTab, setActiveTab] = useState<ActiveTab>("home");
+  const [intelligenceQuery, setIntelligenceQuery] = useState(
+    "commercial beekeepers offering almond pollination in California",
+  );
+  const [intelligenceResults, setIntelligenceResults] = useState<
+    IntelligenceResult[]
+  >([]);
+  const [intelligenceLoading, setIntelligenceLoading] = useState(false);
+  const [intelligenceError, setIntelligenceError] = useState("");
+  const sessionRef = useRef<Session | null>(null);
+  const audioRef = useRef<LiveAudio | null>(null);
+  const panoramaRef = useRef<PanoramaHandle>(null);
+  const visualTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const participantIdRef = useRef<string | null>(null);
+  const shareVisualRef = useRef(false);
+  const agentVisionLiveRef = useRef(false);
+  const sceneKindRef = useRef<"none" | "real" | "synthetic">("none");
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const participantDraftRef = useRef("");
+  const agentDraftRef = useRef("");
+  const audioOutputReceivedRef = useRef(false);
+  const finalizedRef = useRef(false);
+  const sceneEvidenceRef = useRef<SceneEvidence | null>(null);
+  const visionCheckInFlightRef = useRef(false);
+  const lastVisionCheckRef = useRef(0);
+
+  const selected = participants.find((participant) => participant.id === selectedId) ?? null;
+  const matches = useMemo(() => computeMatches(participants), [participants]);
+
+  const loadData = useCallback(async () => {
+    try {
+      const [participantData, observationData] = await Promise.all([
+        jsonFetch<{ participants: Participant[] }>("/api/participants"),
+        jsonFetch<{ observations: Observation[] }>("/api/observations"),
+      ]);
+      setParticipants(participantData.participants);
+      setObservations(observationData.observations);
+      if (!selectedId && participantData.participants[0]) {
+        setSelectedId(participantData.participants[0].id);
+      }
+    } catch (error) {
+      setLiveError(
+        error instanceof Error ? error.message : "Could not load saved field records.",
+      );
+    }
+  }, [selectedId]);
+
+  useEffect(() => {
+    // Initial hydration from the platform-backed participant ledger.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcript, liveDraft]);
+
+  useEffect(() => {
+    shareVisualRef.current = shareVisual;
+  }, [shareVisual]);
+
+  useEffect(
+    () => () => {
+      if (visualTimerRef.current) clearInterval(visualTimerRef.current);
+      sessionRef.current?.close();
+      audioRef.current?.close();
+    },
+    [],
+  );
+
+  const addTranscript = useCallback(
+    async (line: TranscriptLine) => {
+      setTranscript((current) => [...current, line]);
+      const participantId = participantIdRef.current;
+      if (!participantId) return;
+      try {
+        await jsonFetch("/api/participants", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: participantId,
+            role,
+            transcriptLine: line,
+          }),
+        });
+      } catch {
+        setNotice("Transcript is visible, but this line could not be saved.");
+      }
+    },
+    [role],
+  );
+
+  const flushTranscriptTurn = useCallback(async () => {
+    const participantText = participantDraftRef.current.trim();
+    const agentText = agentDraftRef.current.trim();
+    participantDraftRef.current = "";
+    agentDraftRef.current = "";
+    setLiveDraft({ participant: "", agent: "" });
+
+    if (participantText) {
+      await addTranscript({
+        speaker: "participant",
+        text: participantText,
+        at: new Date().toISOString(),
+      });
+    }
+    if (agentText) {
+      await addTranscript({
+        speaker: "agent",
+        text: agentText,
+        at: new Date().toISOString(),
+      });
+    }
+  }, [addTranscript]);
+
+  const saveFact = useCallback(
+    async (args: Record<string, unknown>) => {
+      const participantId = participantIdRef.current;
+      if (!participantId) return { saved: false };
+      const result = await jsonFetch<{ participant: Participant }>(
+        "/api/participants",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: participantId,
+            role,
+            fact: args,
+          }),
+        },
+      );
+      setParticipants((current) => {
+        const without = current.filter((item) => item.id !== result.participant.id);
+        return [result.participant, ...without];
+      });
+      setSelectedId(result.participant.id);
+      return { saved: true, field: args.field };
+    },
+    [role],
+  );
+
+  const saveObservation = useCallback(
+    async (args: Record<string, unknown>) => {
+      const participantId = participantIdRef.current;
+      if (!participantId) return { saved: false };
+      if (args.evidenceType === "visual" && sceneKindRef.current === "synthetic") {
+        return {
+          saved: false,
+          reason:
+            "The shared image is a synthetic staging scene, so visual observations are not added to the evidence ledger.",
+        };
+      }
+      const orientation = panoramaRef.current?.getOrientation();
+      const result = await jsonFetch<{ observation: Observation }>(
+        "/api/observations",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            participantId,
+            ...args,
+            panoramaYaw: orientation?.yaw ?? null,
+            panoramaPitch: orientation?.pitch ?? null,
+          }),
+        },
+      );
+      setObservations((current) => [result.observation, ...current]);
+      return { saved: true, observationId: result.observation.id };
+    },
+    [],
+  );
+
+  const finalizeProfile = useCallback(
+    async () => {
+      const participantId = participantIdRef.current;
+      if (!participantId) return { saved: false };
+      if (finalizedRef.current) {
+        return { saved: true, status: "confirmed", alreadyConfirmed: true };
+      }
+      const result = await jsonFetch<{ participant: Participant }>(
+        "/api/participants",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: participantId,
+            role,
+            interviewStatus: "confirmed",
+          }),
+        },
+      );
+      finalizedRef.current = true;
+      setParticipants((current) => [
+        result.participant,
+        ...current.filter((item) => item.id !== result.participant.id),
+      ]);
+      setNotice("Profile accepted automatically and ready for matching.");
+      return { saved: true, status: "confirmed" };
+    },
+    [role],
+  );
+
+  const verifyVisualFrame = useCallback(
+    async (frame: { data: string; mimeType: string }) => {
+      const now = Date.now();
+      if (
+        visionCheckInFlightRef.current ||
+        now - lastVisionCheckRef.current < 6000
+      ) {
+        return;
+      }
+      visionCheckInFlightRef.current = true;
+      lastVisionCheckRef.current = now;
+      setVisionStatus("checking");
+      const sceneKind = sceneKindRef.current;
+      const orientation = panoramaRef.current?.getOrientation();
+      try {
+        const evidence = await jsonFetch<SceneEvidence>("/api/vision/inspect", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...frame,
+            sceneKind,
+            yaw: orientation?.yaw ?? null,
+            pitch: orientation?.pitch ?? null,
+          }),
+        });
+        if (
+          !shareVisualRef.current ||
+          sceneKindRef.current !== sceneKind
+        ) {
+          return;
+        }
+        sceneEvidenceRef.current = evidence;
+        setSceneEvidence(evidence);
+        agentVisionLiveRef.current = true;
+        setAgentVisionLive(true);
+        setVisionStatus("verified");
+      } catch {
+        sceneEvidenceRef.current = null;
+        setSceneEvidence(null);
+        agentVisionLiveRef.current = false;
+        setAgentVisionLive(false);
+        setVisionStatus("unavailable");
+      } finally {
+        visionCheckInFlightRef.current = false;
+      }
+    },
+    [],
+  );
+
+  const getCurrentSceneEvidence = useCallback(() => {
+    const evidence = sceneEvidenceRef.current;
+    const ageMs = evidence
+      ? Date.now() - new Date(evidence.analyzedAt).valueOf()
+      : Number.POSITIVE_INFINITY;
+    if (!shareVisualRef.current || !evidence || ageMs > 15_000) {
+      return {
+        available: false,
+        instruction:
+          "Tell the participant that no fresh verified visual frame is available. Do not describe the scene.",
+      };
+    }
+    return {
+      available: true,
+      analyzedAt: evidence.analyzedAt,
+      summary: evidence.summary,
+      observations: evidence.observations,
+      limitations: evidence.limitations,
+      instruction:
+        "Answer only from these observations and state any relevant limitation.",
+    };
+  }, []);
+
+  async function handleLiveMessage(message: LiveServerMessage) {
+    if (message.serverContent?.interrupted) {
+      audioRef.current?.stopPlayback();
+      await flushTranscriptTurn();
+    }
+    for (const chunk of getLiveAudioChunks(message)) {
+      if (!audioOutputReceivedRef.current) {
+        audioOutputReceivedRef.current = true;
+        setAudioHealth((current) => ({ ...current, output: true }));
+      }
+      void audioRef.current
+        ?.playBase64Pcm(chunk.data, chunk.mimeType)
+        .catch((error: unknown) => {
+          setLiveError(
+            error instanceof Error
+              ? error.message
+              : "Relay sent audio, but the browser could not play it.",
+          );
+        });
+    }
+
+    const participantText = message.serverContent?.inputTranscription?.text;
+    if (participantText) {
+      participantDraftRef.current = mergeTranscriptChunk(
+        participantDraftRef.current,
+        participantText,
+      );
+      setLiveDraft((current) => ({
+        ...current,
+        participant: participantDraftRef.current,
+      }));
+    }
+    const agentText = message.serverContent?.outputTranscription?.text;
+    if (agentText) {
+      agentDraftRef.current = mergeTranscriptChunk(
+        agentDraftRef.current,
+        agentText,
+      );
+      setLiveDraft((current) => ({
+        ...current,
+        agent: agentDraftRef.current,
+      }));
+    }
+    if (message.serverContent?.turnComplete) {
+      await flushTranscriptTurn();
+    }
+
+    const calls = message.toolCall?.functionCalls ?? [];
+    for (const call of calls) {
+      let response: Record<string, unknown>;
+      try {
+        if (call.name === "update_profile_fact") {
+          response = await saveFact(call.args ?? {});
+        } else if (call.name === "record_inspection_observation") {
+          response = await saveObservation(call.args ?? {});
+        } else if (call.name === "finish_interview") {
+          response = await finalizeProfile();
+        } else if (call.name === "get_current_scene_evidence") {
+          response = getCurrentSceneEvidence();
+        } else {
+          response = { error: "Unknown tool" };
+        }
+      } catch (error) {
+        response = {
+          error: error instanceof Error ? error.message : "Tool execution failed",
+        };
+      }
+      sessionRef.current?.sendToolResponse({
+        functionResponses: {
+          id: call.id,
+          name: call.name,
+          response,
+        },
+      });
+    }
+  }
+
+  const sendCurrentVisualFrame = useCallback(() => {
+    if (!shareVisualRef.current || !sessionRef.current) return false;
+    const frame = panoramaRef.current?.captureFrame();
+    if (!frame) {
+      setVisionStatus("unavailable");
+      return false;
+    }
+    setVisionStatus((current) =>
+      current === "verified" ? current : "sending",
+    );
+    sessionRef.current.sendRealtimeInput({
+      video: { data: frame.data, mimeType: frame.mimeType },
+    });
+    void verifyVisualFrame(frame);
+    return true;
+  }, [verifyVisualFrame]);
+
+  const handlePanoramaAvailability = useCallback(
+    (available: boolean) => {
+      setVisualReady(available);
+      if (!available) {
+        agentVisionLiveRef.current = false;
+        setAgentVisionLive(false);
+        sceneEvidenceRef.current = null;
+        setSceneEvidence(null);
+        setVisionStatus("unavailable");
+        return;
+      }
+      sendCurrentVisualFrame();
+    },
+    [sendCurrentVisualFrame],
+  );
+
+  const handleSceneKindChange = useCallback(
+    (kind: "none" | "real" | "synthetic") => {
+      sceneKindRef.current = kind;
+      agentVisionLiveRef.current = false;
+      setAgentVisionLive(false);
+      sceneEvidenceRef.current = null;
+      setSceneEvidence(null);
+      lastVisionCheckRef.current = 0;
+      setVisionStatus("off");
+    },
+    [],
+  );
+
+  function startVisualFrames() {
+    if (visualTimerRef.current) clearInterval(visualTimerRef.current);
+    sendCurrentVisualFrame();
+    visualTimerRef.current = setInterval(sendCurrentVisualFrame, 1000);
+  }
+
+  async function startInterview() {
+    setLiveState("connecting");
+    setLiveError("");
+    setNotice("");
+    setAudioHealth({ microphone: false, output: false, level: 0 });
+    audioOutputReceivedRef.current = false;
+    setShareVisual(true);
+    shareVisualRef.current = true;
+    setAgentVisionLive(false);
+    agentVisionLiveRef.current = false;
+    sceneEvidenceRef.current = null;
+    setSceneEvidence(null);
+    lastVisionCheckRef.current = 0;
+    setVisionStatus("sending");
+
+    audioRef.current?.close();
+    const audio = new LiveAudio();
+    audioRef.current = audio;
+    try {
+      // Create and resume Web Audio during the click gesture. Waiting until
+      // after token/session requests can leave both capture and playback
+      // suspended by browser autoplay policy.
+      await audio.prepare();
+    } catch (error) {
+      audio.close();
+      audioRef.current = null;
+      setShareVisual(false);
+      shareVisualRef.current = false;
+      setVisionStatus("off");
+      setLiveState("error");
+      setLiveError(
+        error instanceof Error ? error.message : "Could not enable browser audio.",
+      );
+      return;
+    }
+
+    const participantId = crypto.randomUUID();
+    participantIdRef.current = participantId;
+    finalizedRef.current = false;
+    setSelectedId(participantId);
+    setTranscript([]);
+    participantDraftRef.current = "";
+    agentDraftRef.current = "";
+    setLiveDraft({ participant: "", agent: "" });
+
+    try {
+      const created = await jsonFetch<{ participant: Participant }>(
+        "/api/participants",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: participantId, role }),
+        },
+      );
+      setParticipants((current) => [created.participant, ...current]);
+
+      const tokenData = await jsonFetch<{ token: string; model: string }>(
+        "/api/gemini/token",
+        { method: "POST" },
+      );
+      const ai = new GoogleGenAI({
+        apiKey: tokenData.token,
+        apiVersion: "v1beta",
+      });
+      const session = await ai.live.connect({
+        model: tokenData.model,
+        callbacks: {
+          onopen: () => setNotice("Secure voice channel connected."),
+          onmessage: (message) => void handleLiveMessage(message),
+          onerror: (event) => {
+            setLiveError(event.message || "The live interview encountered an error.");
+            setLiveState("error");
+          },
+          onclose: () => {
+            setAudioHealth((current) => ({
+              ...current,
+              microphone: false,
+              level: 0,
+            }));
+            setLiveState((current) => (current === "ending" ? "idle" : current));
+          },
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          systemInstruction: buildSystemInstruction(role),
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Aoede" },
+            },
+          },
+          tools: [
+            {
+              functionDeclarations: [
+                interviewTool,
+                observationTool,
+                finishTool,
+                sceneEvidenceTool,
+              ],
+            },
+          ],
+          sessionResumption: {},
+          temperature: 0,
+        },
+      });
+      sessionRef.current = session;
+      await audio.startCapture((pcm) => {
+        sessionRef.current?.sendRealtimeInput({
+          audio: {
+            data: arrayBufferToBase64(pcm),
+            mimeType: "audio/pcm;rate=16000",
+          },
+        });
+      }, (level) => {
+        setAudioHealth((current) => ({
+          ...current,
+          microphone: true,
+          level,
+        }));
+      });
+      setAudioHealth((current) => ({ ...current, microphone: true }));
+      setLiveState("listening");
+      startVisualFrames();
+      session.sendRealtimeInput({
+        text: `Begin now with this exact standardized opening and nothing before it: "Hi, I'm Relay. I'll ask the same ten questions we use in every ${role} intake and save only what you explicitly tell me. Question 1 of 10. ${INTERVIEW_SCRIPTS[role][0]}" A live inspection frame is shared automatically when available, but it must not change the script order.`,
+      });
+    } catch (error) {
+      audio.close();
+      audioRef.current = null;
+      sessionRef.current?.close();
+      sessionRef.current = null;
+      if (visualTimerRef.current) clearInterval(visualTimerRef.current);
+      visualTimerRef.current = null;
+      setShareVisual(false);
+      shareVisualRef.current = false;
+      setAgentVisionLive(false);
+      agentVisionLiveRef.current = false;
+      sceneEvidenceRef.current = null;
+      setSceneEvidence(null);
+      setVisionStatus("off");
+      setLiveState("error");
+      setLiveError(
+        error instanceof Error ? error.message : "Could not start the interview.",
+      );
+    }
+  }
+
+  async function stopInterview(skipFlush = false) {
+    setLiveState("ending");
+    if (!skipFlush) await flushTranscriptTurn();
+    if (visualTimerRef.current) clearInterval(visualTimerRef.current);
+    visualTimerRef.current = null;
+    audioRef.current?.stopCapture();
+    setAudioHealth((current) => ({
+      ...current,
+      microphone: false,
+      level: 0,
+    }));
+    setShareVisual(false);
+    shareVisualRef.current = false;
+    setAgentVisionLive(false);
+    agentVisionLiveRef.current = false;
+    sceneEvidenceRef.current = null;
+    setSceneEvidence(null);
+    setVisionStatus("off");
+    sessionRef.current?.sendRealtimeInput({ audioStreamEnd: true });
+    window.setTimeout(() => {
+      sessionRef.current?.close();
+      sessionRef.current = null;
+      audioRef.current?.close();
+      audioRef.current = null;
+      setAudioHealth({ microphone: false, output: false, level: 0 });
+      setLiveState("idle");
+      void loadData();
+    }, 400);
+  }
+
+  async function finishAndMatch() {
+    try {
+      await flushTranscriptTurn();
+      const result = await finalizeProfile();
+      if (!result.saved) {
+        throw new Error("No active participant profile could be finalized.");
+      }
+      await stopInterview(true);
+      setActiveTab("matches");
+      window.requestAnimationFrame(() => window.scrollTo(0, 0));
+    } catch (error) {
+      setLiveState("listening");
+      setLiveError(
+        error instanceof Error
+          ? error.message
+          : "Could not finish and match this interview.",
+      );
+    }
+  }
+
+  async function confirmProfile(participant: Participant) {
+    try {
+      const result = await jsonFetch<{ participant: Participant }>(
+        "/api/participants",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: participant.id,
+            role: participant.role,
+            interviewStatus: "confirmed",
+          }),
+        },
+      );
+      setParticipants((current) => [
+        result.participant,
+        ...current.filter((item) => item.id !== participant.id),
+      ]);
+      setNotice("Profile confirmed and eligible for matching.");
+    } catch (error) {
+      setLiveError(error instanceof Error ? error.message : "Could not confirm profile.");
+    }
+  }
+
+  async function searchIntelligence(query = intelligenceQuery) {
+    const cleanQuery = query.trim();
+    if (!cleanQuery) return;
+    setIntelligenceLoading(true);
+    setIntelligenceError("");
+    setIntelligenceQuery(cleanQuery);
+    try {
+      const result = await jsonFetch<{ results: IntelligenceResult[] }>(
+        "/api/intelligence/search",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: cleanQuery }),
+        },
+      );
+      setIntelligenceResults(result.results);
+    } catch (error) {
+      setIntelligenceError(
+        error instanceof Error ? error.message : "Could not search public sources.",
+      );
+    } finally {
+      setIntelligenceLoading(false);
+    }
+  }
+
+  const live = liveState === "listening";
+  const busy = liveState === "connecting" || liveState === "ending";
+  const selectedFacts = selected ? safeFacts(selected.profileJson) : {};
+  const required = selected ? REQUIRED_FIELDS[selected.role] : REQUIRED_FIELDS[role];
+  const completeness = selected
+    ? Math.round(
+        (required.filter((field) => selectedFacts[field]).length / required.length) * 100,
+      )
+    : 0;
+
+  function openTab(next: ActiveTab) {
+    setActiveTab(next);
+    window.requestAnimationFrame(() => window.scrollTo(0, 0));
+  }
+
+  return (
+    <main className={activeTab === "inspection" ? "inspection-mode" : ""}>
+      <header className="site-header">
+        <button className="brand" onClick={() => openTab("home")} aria-label="Relay home">
+          <span className="brand-mark"><Hexagon size={20} /></span>
+          <span>Relay</span>
+          <em>pollination broker</em>
+        </button>
+        <nav className="desktop-nav" aria-label="Primary navigation">
+          <button className={activeTab === "inspection" ? "active" : ""} onClick={() => openTab("inspection")}>
+            Inspection
+          </button>
+          <button className={activeTab === "profiles" ? "active" : ""} onClick={() => openTab("profiles")}>
+            Profiles <span>{participants.length}</span>
+          </button>
+          <button className={activeTab === "matches" ? "active" : ""} onClick={() => openTab("matches")}>
+            Matches <span>{matches.length}</span>
+          </button>
+          <button className={activeTab === "intelligence" ? "active" : ""} onClick={() => openTab("intelligence")}>
+            Field intelligence
+          </button>
+        </nav>
+        <div className="header-status"><span className="secure-dot" /> Evidence on</div>
+      </header>
+
+      {activeTab === "home" && (
+        <section className="relay-home" id="top">
+          <div className="home-hero">
+            <div className="home-scrim" />
+            <div className="home-copy">
+              <span className="hero-kicker"><Waves size={16} /> Remote pollination brokerage</span>
+              <h1>See the apiary.<br /><i>Hear the operator.</i><br />Make the right match.</h1>
+              <p>
+                Relay gives bee brokers a live 360° field view, conducts the
+                intake by voice, and turns confirmed facts into matchable
+                beekeeper and grower profiles.
+              </p>
+              <div className="home-actions">
+                <button className="button home-primary" onClick={() => openTab("inspection")}>
+                  Enter 360° inspection <ArrowRight size={17} />
+                </button>
+                <button className="button home-secondary" onClick={() => openTab("intelligence")}>
+                  Search real sources <Search size={17} />
+                </button>
+              </div>
+            </div>
+            <div className="home-proof">
+              <span><Camera size={16} /> Live camera or 360° field scene</span>
+              <span><AudioLines size={16} /> Natural voice intake</span>
+              <span><ShieldCheck size={16} /> Human-confirmed evidence</span>
+            </div>
+            <div className="home-process">
+              <span>01 <b>Inspect remotely</b></span>
+              <span>02 <b>Capture decision-grade facts</b></span>
+              <span>03 <b>Pair beekeeper + grower</b></span>
+            </div>
+          </div>
+
+          <div className="home-context">
+            <div>
+              <span className="eyebrow">Built around actual broker work</span>
+              <h2>Less windshield time.<br />More informed introductions.</h2>
+            </div>
+            <p>
+              The demo starts with a close-range apiary already loaded. In the
+              field, switch to the phone camera and walk the broker through the
+              entire surrounding while Relay asks the missing questions.
+            </p>
+            <button onClick={() => openTab("inspection")}>
+              Open field room <ChevronRight size={17} />
+            </button>
+          </div>
+        </section>
+      )}
+
+      {activeTab === "inspection" && (
+        <section className="inspection-room">
+          <PanoramaInspector
+            ref={panoramaRef}
+            onAvailabilityChange={handlePanoramaAvailability}
+            onSceneKindChange={handleSceneKindChange}
+          />
+
+          <div className="inspection-title">
+            <span className="live-location"><MapPin size={14} /> Demo orchard · Block 12</span>
+            <h1>Remote apiary inspection</h1>
+            <p>Synthetic demo scene · visual notes are not diagnostic evidence</p>
+          </div>
+
+          <section className="floating-interview">
+            <div className="floating-agent-row">
+              <span className={`agent-orb ${live ? "speaking" : ""}`}><AudioLines size={19} /></span>
+              <span>
+                <strong>Relay · live broker</strong>
+                <small>
+                  {liveState === "connecting"
+                    ? "Enabling microphone + speaker…"
+                    : live
+                      ? audioHealth.output
+                        ? "Two-way voice connected"
+                        : "Microphone live · waiting for Relay"
+                      : "Ready for voice intake"}
+                </small>
+              </span>
+              <span className={`live-badge ${live ? "on" : ""}`}><span />{live ? "Live" : "Ready"}</span>
+            </div>
+
+            <div className="compact-role-switch" role="group" aria-label="Participant role">
+              {(["beekeeper", "grower"] as ParticipantRole[]).map((item) => (
+                <button
+                  key={item}
+                  className={role === item ? "selected" : ""}
+                  disabled={live}
+                  onClick={() => setRole(item)}
+                >
+                  {item === "beekeeper" ? <Hexagon size={15} /> : <Sprout size={15} />}
+                  {item}
+                </button>
+              ))}
+              <button
+                className={`share-scene ${agentVisionLive ? "selected" : ""}`}
+                disabled={!visualReady || !live}
+                onClick={() => {
+                  const next = !shareVisualRef.current;
+                  shareVisualRef.current = next;
+                  setShareVisual(next);
+                  if (next) {
+                    lastVisionCheckRef.current = 0;
+                    setVisionStatus("sending");
+                    sendCurrentVisualFrame();
+                  } else {
+                    agentVisionLiveRef.current = false;
+                    setAgentVisionLive(false);
+                    sceneEvidenceRef.current = null;
+                    setSceneEvidence(null);
+                    setVisionStatus("off");
+                  }
+                }}
+              >
+                <Eye size={15} />
+                {visionStatus === "verified"
+                  ? "Vision verified"
+                  : visionStatus === "checking"
+                    ? "Checking exact frame…"
+                    : visionStatus === "unavailable"
+                      ? "Frame unavailable"
+                      : shareVisual
+                        ? "Sending frame…"
+                        : live
+                          ? "Share scene"
+                          : "Auto-share on start"}
+              </button>
+            </div>
+
+            <div className="standardized-intake">
+              <ClipboardCheck size={14} />
+              <span>Standardized intake</span>
+              <b>{INTERVIEW_SCRIPTS[role].length} questions · fixed order</b>
+            </div>
+
+            <div className="duplex-health" aria-label="Live audio status">
+              <span className={audioHealth.microphone ? "healthy" : ""}>
+                <Mic size={13} />
+                {audioHealth.microphone ? "Mic active" : "Mic waiting"}
+                <i
+                  aria-hidden="true"
+                  style={{
+                    "--mic-level": `${Math.max(8, audioHealth.level * 100)}%`,
+                  } as React.CSSProperties}
+                />
+              </span>
+              <span className={audioHealth.output ? "healthy" : ""}>
+                <Volume2 size={13} />
+                {audioHealth.output ? "Relay audio received" : "Relay audio waiting"}
+              </span>
+            </div>
+
+            <div className="floating-transcript">
+              {!transcript.length && !liveDraft.participant && !liveDraft.agent ? (
+                <div className="compact-empty">
+                  <Headphones size={23} />
+                  <span>
+                    Start the interview to speak naturally. Relay will answer
+                    aloud and save complete turns—not word fragments.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  {transcript.map((line, index) => (
+                    <div className={`transcript-line ${line.speaker}`} key={`${line.at}-${index}`}>
+                      <span>{line.speaker === "agent" ? "Relay" : "Participant"}</span>
+                      <p>{line.text}</p>
+                    </div>
+                  ))}
+                  {liveDraft.participant && (
+                    <div className="transcript-line participant live-draft">
+                      <span>Participant · listening</span><p>{liveDraft.participant}</p>
+                    </div>
+                  )}
+                  {liveDraft.agent && (
+                    <div className="transcript-line agent live-draft">
+                      <span>Relay · speaking</span><p>{liveDraft.agent}</p>
+                    </div>
+                  )}
+                </>
+              )}
+              <div ref={transcriptEndRef} />
+            </div>
+
+            {liveError && (
+              <div className="error-banner">
+                <CircleAlert size={15} /><span>{liveError}</span>
+                <button onClick={() => setLiveError("")}><X size={13} /></button>
+              </div>
+            )}
+
+            <div className="floating-controls">
+              {!live ? (
+                <button className="button start-call" disabled={busy} onClick={() => void startInterview()}>
+                  {liveState === "connecting" ? <RefreshCw className="spin" size={17} /> : <Mic size={17} />}
+                  Start {roleCopy(role).noun} interview
+                </button>
+              ) : (
+                <button className="button end-call" onClick={() => void finishAndMatch()}>
+                  <MicOff size={17} /> Finish &amp; match
+                </button>
+              )}
+              <span>{live ? "Auto-accepts profile and opens matches" : "Microphone permission required"}</span>
+            </div>
+          </section>
+
+          <aside className="floating-evidence">
+            <div className="evidence-panel-head">
+              <span><ImageIcon size={16} /> Demo evidence in place</span>
+              <b>3 views · 4 notes</b>
+            </div>
+            <div className="evidence-thumbs" aria-label="Preset inspection photos">
+              <img src="/demo-apiary-panorama-v2.png" alt="Close hive stacks" />
+              <img src="/demo-apiary-panorama-v2.png" alt="Water access" />
+              <img src="/demo-apiary-panorama-v2.png" alt="Vehicle access lane" />
+            </div>
+            <ol className="preset-notes">
+              <li><span>01</span><p>Hive rows are staged on pallets with vehicle access from the gravel lane.</p></li>
+              <li><span>02</span><p>Water tote and hose are visible at the center access point.</p></li>
+              <li><span>03</span><p>Straps and lids are visible; fastening still needs close verification.</p></li>
+              <li className="unverified"><span>!</span><p>Colony strength, brood pattern, queen status, and Varroa load remain unverified.</p></li>
+            </ol>
+            <div className={`verified-scene ${visionStatus}`}>
+              <span>
+                <Eye size={14} /> Agent visual grounding
+                <b>
+                  {visionStatus === "verified"
+                    ? "Verified"
+                    : visionStatus === "checking"
+                      ? "Checking"
+                      : "Not verified"}
+                </b>
+              </span>
+              {sceneEvidence ? (
+                <>
+                  <p>{sceneEvidence.summary}</p>
+                  {sceneEvidence.observations.slice(0, 2).map((observation) => (
+                    <small key={observation}>— {observation}</small>
+                  ))}
+                </>
+              ) : (
+                <p>
+                  Relay must say it cannot verify the frame until this check
+                  succeeds.
+                </p>
+              )}
+            </div>
+            <div className="live-facts-summary">
+              <span><ClipboardCheck size={15} /> Live profile</span>
+              <b>{selected?.displayName || "Waiting for interview"}</b>
+              <small>{selected ? `${completeness}% of required facts captured` : "Confirmed answers appear here"}</small>
+              {!!Object.keys(selectedFacts).length && (
+                <div>
+                  {Object.entries(selectedFacts).slice(0, 3).map(([key, fact]) => (
+                    <p key={key}><span>{PROFILE_LABELS[key] ?? key}</span><b>{formatField(key, fact.value)}</b></p>
+                  ))}
+                </div>
+              )}
+            </div>
+          </aside>
+        </section>
+      )}
+
+      {activeTab === "profiles" && (
+        <ProfilesView
+          participants={participants}
+          observations={observations}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          onConfirm={confirmProfile}
+        />
+      )}
+
+      {activeTab === "matches" && <MatchesView matches={matches} participants={participants} />}
+
+      {activeTab === "intelligence" && (
+        <section className="intelligence-page">
+          <div className="intelligence-intro">
+            <span className="hero-kicker"><Database size={16} /> Live public-source research</span>
+            <h1>Find the real operators.<br /><i>Then verify them by voice.</i></h1>
+            <p>
+              Search current public sources for beekeepers, growers, crop
+              calendars, and pollination programs. Search results are leads—not
+              marketplace profiles—until a person confirms their facts.
+            </p>
+          </div>
+          <form
+            className="source-search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void searchIntelligence();
+            }}
+          >
+            <Search size={20} />
+            <input
+              value={intelligenceQuery}
+              onChange={(event) => setIntelligenceQuery(event.target.value)}
+              aria-label="Search public pollination sources"
+            />
+            <button disabled={intelligenceLoading}>
+              {intelligenceLoading ? <RefreshCw className="spin" size={17} /> : "Search sources"}
+            </button>
+          </form>
+          <div className="search-suggestions">
+            {[
+              "California almond pollination beekeeper association directory",
+              "commercial apiaries offering crop pollination Pacific Northwest",
+              "USDA honey bee colony and pollination reports",
+            ].map((query) => (
+              <button key={query} onClick={() => void searchIntelligence(query)}>{query}</button>
+            ))}
+          </div>
+          {intelligenceError && (
+            <div className="intelligence-error"><CircleAlert size={17} />{intelligenceError}</div>
+          )}
+          {!intelligenceResults.length && !intelligenceLoading && !intelligenceError ? (
+            <div className="source-empty">
+              <BookOpen size={28} />
+              <h2>Start with a source trail</h2>
+              <p>Relay keeps public research separate from confirmed participant data.</p>
+            </div>
+          ) : (
+            <div className="source-grid">
+              {intelligenceResults.map((result) => (
+                <article key={result.url}>
+                  <span>Public source</span>
+                  <h2>{result.title}</h2>
+                  <p>{result.excerpt || "Open the source to review this result."}</p>
+                  <a href={result.url} target="_blank" rel="noreferrer">
+                    Open source <ExternalLink size={15} />
+                  </a>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {notice && (
+        <button className="toast" onClick={() => setNotice("")}>
+          <Check size={16} />
+          {notice}
+          <X size={14} />
+        </button>
+      )}
+
+      {activeTab !== "inspection" && (
+        <footer>
+          <div className="brand footer-brand"><span className="brand-mark"><Hexagon size={18} /></span><span>Relay</span></div>
+          <p>Facts first. Relationships still human.</p>
+          <span>Hackathon field prototype · live voice + 360° vision</span>
+        </footer>
+      )}
+    </main>
+  );
+}
+
+function ProfilesView({
+  participants,
+  observations,
+  selectedId,
+  onSelect,
+  onConfirm,
+}: {
+  participants: Participant[];
+  observations: Observation[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  onConfirm: (participant: Participant) => Promise<void>;
+}) {
+  const selected = participants.find((participant) => participant.id === selectedId) ?? participants[0];
+  const facts = selected ? safeFacts(selected.profileJson) : {};
+  const transcript = selected ? safeTranscript(selected.transcriptJson) : [];
+  const evidence = selected
+    ? observations.filter((item) => item.participantId === selected.id)
+    : [];
+
+  return (
+    <section className="page-section">
+      <div className="page-heading">
+        <span className="hero-kicker"><Users size={16} /> Participant ledger</span>
+        <h1>Profiles with provenance,<br /><i>not marketplace theater.</i></h1>
+        <p>Interview facts and public-source leads stay visibly distinct. Drafts stay out of matching.</p>
+      </div>
+      {!participants.length ? (
+        <div className="large-empty">
+          <Radio size={30} />
+          <h2>No participant records yet</h2>
+          <p>Run a beekeeper or grower interview to create the first real profile.</p>
+        </div>
+      ) : (
+        <div className="ledger-layout">
+          <aside className="profile-list">
+            {participants.map((participant) => (
+              <button
+                key={participant.id}
+                className={selected?.id === participant.id ? "active" : ""}
+                onClick={() => onSelect(participant.id)}
+              >
+                <span className={`mini-role ${participant.role}`}>
+                  {participant.role === "beekeeper" ? <Hexagon size={16} /> : <Sprout size={16} />}
+                </span>
+                <span>
+                  <strong>{participant.displayName}</strong>
+                  <small>{participant.operationName || participant.role}</small>
+                </span>
+                <em className={`status ${participant.interviewStatus}`}>
+                  {participant.interviewStatus === "sourced"
+                    ? "public source"
+                    : participant.interviewStatus}
+                </em>
+                <ChevronRight size={15} />
+              </button>
+            ))}
+          </aside>
+          {selected && (
+            <article className="profile-detail">
+              <div className="profile-top">
+                <div>
+                  <span className="eyebrow">{selected.role} record</span>
+                  <h2>{selected.displayName}</h2>
+                  <p>{selected.operationName || "Operation name not yet captured"}</p>
+                </div>
+                <span className={`status-card ${selected.interviewStatus}`}>
+                  {selected.interviewStatus === "confirmed" && <BadgeCheck size={17} />}
+                  {selected.interviewStatus === "sourced" && <Database size={17} />}
+                  {selected.interviewStatus === "sourced" ? "public source" : selected.interviewStatus}
+                </span>
+              </div>
+              <div className="profile-columns">
+                <section>
+                  <h3>Extracted facts</h3>
+                  {Object.keys(facts).length ? (
+                    <div className="detail-facts">
+                      {Object.entries(facts).map(([key, fact]) => (
+                        <div key={key}>
+                          <span>{PROFILE_LABELS[key] ?? key}</span>
+                          <strong>{formatField(key, fact.value)}</strong>
+                          <p>“{fact.evidence}”</p>
+                          <small>
+                            <ShieldCheck size={12} /> {sourceLabel(fact.source)} · {fact.confidence}
+                            {fact.sourceUrl && (
+                              <>
+                                {" · "}
+                                <a href={fact.sourceUrl} target="_blank" rel="noreferrer">
+                                  verify <ExternalLink size={10} />
+                                </a>
+                              </>
+                            )}
+                          </small>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No facts extracted yet.</p>
+                  )}
+                </section>
+                <section>
+                  <h3>Inspection evidence</h3>
+                  {evidence.length ? (
+                    <div className="evidence-list">
+                      {evidence.map((item) => (
+                        <div key={item.id}>
+                          <span>{item.category}</span>
+                          <p>{item.note}</p>
+                          <small>
+                            {item.evidenceType} · {item.confidence}
+                            {item.panoramaYaw !== null && ` · view ${item.panoramaYaw}°/${item.panoramaPitch}°`}
+                          </small>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">No inspection observations recorded.</p>
+                  )}
+                  <h3 className="transcript-title">Transcript trail</h3>
+                  <p className="muted">{transcript.length} saved lines</p>
+                </section>
+              </div>
+              {selected.interviewStatus === "review" && (
+                <button className="button confirm-button wide" onClick={() => void onConfirm(selected)}>
+                  <BadgeCheck size={17} />
+                  Confirm facts and allow matching
+                </button>
+              )}
+            </article>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MatchesView({
+  matches,
+  participants,
+}: {
+  matches: MatchResult[];
+  participants: Participant[];
+}) {
+  const matchReadyKeepers = participants.filter(
+    (item) => item.role === "beekeeper" && isMatchEligible(item),
+  ).length;
+  const matchReadyGrowers = participants.filter(
+    (item) => item.role === "grower" && isMatchEligible(item),
+  ).length;
+
+  return (
+    <section className="page-section">
+      <div className="page-heading match-heading">
+        <span className="hero-kicker"><Handshake size={16} /> Pairing desk</span>
+        <h1>Explain the fit.<br /><i>Expose what is still unknown.</i></h1>
+        <p>Scores use confirmed interviews and clearly labeled public-source leads. Unknown information is shown—not guessed.</p>
+      </div>
+      <div className="market-summary">
+        <div><Hexagon size={18} /><strong>{matchReadyKeepers}</strong><span>match-ready beekeepers</span></div>
+        <div><Sprout size={18} /><strong>{matchReadyGrowers}</strong><span>match-ready growers</span></div>
+        <div><Handshake size={18} /><strong>{matches.length}</strong><span>reviewable pairings</span></div>
+      </div>
+      {!matches.length ? (
+        <div className="large-empty">
+          <Handshake size={30} />
+          <h2>A match needs both sides</h2>
+          <p>
+            Finish one interview. Relay will pair it with a verified,
+            public-source lead while keeping unknown commercial terms visible.
+          </p>
+        </div>
+      ) : (
+        <div className="match-grid">
+          {matches.map((match) => (
+            <article className="match-card" key={`${match.beekeeper.id}-${match.grower.id}`}>
+              <div className="match-score">
+                <span>{match.score}</span>
+                <small>known-fit score</small>
+              </div>
+              <div className="pair-row">
+                <div>
+                  <span className="mini-role beekeeper"><Hexagon size={17} /></span>
+                  <small>Beekeeper</small>
+                  <strong>{match.beekeeper.displayName}</strong>
+                  <p>{match.beekeeper.operationName}</p>
+                </div>
+                <div className="pair-line"><ArrowRight size={18} /></div>
+                <div>
+                  <span className="mini-role grower"><Sprout size={17} /></span>
+                  <small>Grower</small>
+                  <strong>{match.grower.displayName}</strong>
+                  <p>{match.grower.operationName}</p>
+                </div>
+              </div>
+              <div className="signal-list">
+                {match.knownSignals.map((signal) => (
+                  <div key={signal.label}>
+                    {signal.label === "Location" ? <MapPin size={15} /> : signal.label === "Service window" ? <CalendarDays size={15} /> : <Hexagon size={15} />}
+                    <span><strong>{signal.label}</strong>{signal.value}</span>
+                    <em className={signal.positive ? "good" : "warn"}>
+                      {signal.positive ? <Check size={13} /> : <CircleAlert size={13} />}
+                    </em>
+                  </div>
+                ))}
+              </div>
+              {!!match.unresolved.length && (
+                <div className="unresolved">
+                  <span><Route size={15} /> Broker follow-up</span>
+                  {match.unresolved.map((item) => <p key={item}>— {item}</p>)}
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
