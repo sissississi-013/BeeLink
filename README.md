@@ -15,6 +15,9 @@ human-confirmed profiles or clearly labeled public-source leads.
 - Draft and review records are excluded from matching; confirmed interviews
   and sourced leads are match-ready.
 - Visual notes are observations, not pest or disease diagnoses.
+- The browser force-renders the exact visible panorama perspective, rejects
+  blank WebGL captures, and verifies the same frame with a separate image
+  analysis before Relay may describe it.
 - The bundled panorama is explicitly synthetic and cannot create visual
   evidence records. Users can upload a real equirectangular scene instead.
 

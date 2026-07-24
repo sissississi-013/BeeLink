@@ -204,10 +204,55 @@ export const PanoramaInspector = memo(forwardRef<PanoramaHandle, Props>(
         }
 
         const canvas = containerRef.current?.querySelector("canvas");
-        if (!canvas || !viewerRef.current?.isLoaded()) return null;
+        const viewer = viewerRef.current;
+        if (!canvas || !viewer?.isLoaded()) return null;
         try {
+          // Force Pannellum to render the exact visible perspective before
+          // reading its WebGL canvas. Reading the canvas later can return an
+          // empty buffer because WebGL does not preserve it between paints.
+          viewer.getRenderer().render(
+            (viewer.getPitch() * Math.PI) / 180,
+            (viewer.getYaw() * Math.PI) / 180,
+            (viewer.getHfov() * Math.PI) / 180,
+            { returnImage: true },
+          );
+          const output = document.createElement("canvas");
+          const scale = Math.min(1, 960 / canvas.width);
+          output.width = Math.max(1, Math.round(canvas.width * scale));
+          output.height = Math.max(1, Math.round(canvas.height * scale));
+          const context = output.getContext("2d", { willReadFrequently: true });
+          if (!context) return null;
+          context.drawImage(canvas, 0, 0, output.width, output.height);
+
+          // Refuse to send a blank / cleared WebGL surface.
+          const sample = document.createElement("canvas");
+          sample.width = 16;
+          sample.height = 9;
+          const sampleContext = sample.getContext("2d", {
+            willReadFrequently: true,
+          });
+          if (!sampleContext) return null;
+          sampleContext.drawImage(output, 0, 0, sample.width, sample.height);
+          const pixels = sampleContext.getImageData(
+            0,
+            0,
+            sample.width,
+            sample.height,
+          ).data;
+          let min = 255;
+          let max = 0;
+          for (let index = 0; index < pixels.length; index += 4) {
+            const luminance =
+              pixels[index] * 0.2126 +
+              pixels[index + 1] * 0.7152 +
+              pixels[index + 2] * 0.0722;
+            min = Math.min(min, luminance);
+            max = Math.max(max, luminance);
+          }
+          if (max - min < 4) return null;
+
           return {
-            data: canvas.toDataURL("image/jpeg", 0.68).split(",")[1],
+            data: output.toDataURL("image/jpeg", 0.78).split(",")[1],
             mimeType: "image/jpeg",
           };
         } catch {

@@ -2472,6 +2472,46 @@ button.brand {
   color: #f0c8a9;
 }
 
+.verified-scene {
+  background: rgba(10, 25, 18, 0.72);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 10px 12px;
+}
+
+.verified-scene > span {
+  align-items: center;
+  color: rgba(255, 255, 255, 0.72);
+  display: flex;
+  font-size: 9px;
+  font-weight: 800;
+  gap: 5px;
+  text-transform: uppercase;
+}
+
+.verified-scene > span b {
+  color: #f0c8a9;
+  font-size: 8px;
+  margin-left: auto;
+}
+
+.verified-scene.verified > span b {
+  color: #93e8af;
+}
+
+.verified-scene p,
+.verified-scene small {
+  color: rgba(255, 255, 255, 0.62);
+  display: block;
+  font-size: 9px;
+  line-height: 1.4;
+  margin: 6px 0 0;
+}
+
+.verified-scene small {
+  color: rgba(255, 255, 255, 0.76);
+  margin-top: 3px;
+}
+
 .live-facts-summary {
   background: rgba(255, 255, 255, 0.05);
   border-top: 1px solid rgba(255, 255, 255, 0.12);
