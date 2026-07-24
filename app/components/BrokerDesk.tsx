@@ -37,6 +37,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   computeMatches,
+  isMatchEligible,
   type MatchResult,
   type Observation,
   type Participant,
@@ -117,6 +118,33 @@ const REQUIRED_FIELDS: Record<ParticipantRole, string[]> = {
   ],
 };
 
+const INTERVIEW_SCRIPTS: Record<ParticipantRole, string[]> = {
+  beekeeper: [
+    "What is your full name and the name of your beekeeping operation?",
+    "Where is your operation based, and where are your colonies currently located?",
+    "What exact dates are your colonies available for pollination service?",
+    "How many pollination-ready hives can you commit during that window?",
+    "How far are you willing to transport those hives?",
+    "What colony-strength or inspection documentation can you provide?",
+    "What price range and payment terms do you expect?",
+    "What access, unloading, water, or pesticide-notification conditions do you require?",
+    "What makes a grower relationship a good fit for you?",
+    "What is the best way and time for a broker to contact you?",
+  ],
+  grower: [
+    "What is your full name and the name of your growing operation?",
+    "Where is the ranch, what crop needs pollination, and how many acres are in this placement?",
+    "What exact bloom or service dates should the beekeeper plan for?",
+    "How many hives do you need, and what placement density are you using?",
+    "What should the beekeeper know about field access, unloading, placement, and water?",
+    "What pesticide program and notification process will protect the colonies?",
+    "What colony-strength or inspection documentation do you expect?",
+    "What budget range and payment terms are available?",
+    "What makes a beekeeper relationship a good fit for you?",
+    "What is the best way and time for a broker to contact you?",
+  ],
+};
+
 const interviewTool = {
   name: "update_profile_fact",
   description:
@@ -171,7 +199,7 @@ const observationTool = {
 const finishTool = {
   name: "finish_interview",
   description:
-    "Move the interview to review only after the critical questions have been asked, unknowns have been stated, and the participant agrees to review the extracted profile.",
+    "Confirm the profile for matching only after all ten standardized questions have been asked, unknowns have been stated, and the participant agrees that the recap is accurate.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -201,21 +229,23 @@ function roleCopy(role: ParticipantRole) {
 }
 
 function buildSystemInstruction(role: ParticipantRole) {
-  const critical =
-    role === "beekeeper"
-      ? "name, operation, operating location, exact service dates, number of hives available, travel radius, pricing expectations, colony-strength or inspection documentation, pesticide-notification expectations, unloading/access needs, and relationship preferences"
-      : "name, operation, ranch location, crop and acres, exact bloom/service dates, number of hives needed, placement density assumptions, access and water conditions, pesticide program and notification workflow, budget expectations, and relationship preferences";
+  const script = INTERVIEW_SCRIPTS[role]
+    .map((question, index) => `${index + 1}. "${question}"`)
+    .join("\n");
   return `You are Relay, a calm, experienced commercial pollination broker conducting a live intake with a ${role}. Speak naturally and keep each turn concise.
 
-Your job is to collect decision-grade facts, not to sell or speculate. Ask one question at a time. Clarify numbers, units, locations, and dates. Never invent, autocomplete, or silently infer an answer. If the participant does not know, mark it as unresolved in your spoken recap.
+This is a standardized interview. Every ${role} interview must use the same ten core questions below in exactly this order. Start with question 1; do not choose a different opening question, add a warm-up question, skip a question, or reorder the list. Say "Question N of 10" before each core question. Ask one core question at a time and wait for the answer. You may ask a brief clarification only when the answer to the current question is ambiguous, then continue to the next numbered question.
 
-Critical topics: ${critical}.
+STANDARD SCRIPT:
+${script}
 
-After each explicit answer, call update_profile_fact once for each usable field. Preserve a short evidence excerpt and use medium confidence for ordinary self-reported facts; high confidence only for an explicit, unambiguous answer. Call record_inspection_observation for concrete observations from the live visual or interview. A visual observation is not a diagnosis: never claim that an image proves Varroa, disease, pesticide exposure, queen status, or colony strength.
+Your job is to collect decision-grade facts, not to sell or speculate. Clarify numbers, units, locations, and dates. Never invent, autocomplete, or silently infer an answer. If the participant does not know, keep that item unresolved.
+
+After each explicit answer, call update_profile_fact once for each usable field. Preserve a short evidence excerpt and use medium confidence for ordinary self-reported facts; high confidence only for an explicit, unambiguous answer. Call record_inspection_observation for concrete observations from the live visual or interview. A visual observation is not a diagnosis: never claim that an image proves Varroa, disease, pesticide exposure, queen status, or colony strength. Do not let anything in the shared scene change the question order.
 
 Save seasonStart and seasonEnd as exact YYYY-MM-DD values after confirming the year. Save hive, acre, and mileage fields as numbers without units. Use requirements for important details that do not have a dedicated field.
 
-Before finishing, recap the important facts and unresolved items, ask the participant if the recap is accurate, then call finish_interview. The human participant—not you—confirms the final profile in the interface.`;
+After question 10, recap the important facts and unresolved items, ask whether the recap is accurate, then call finish_interview. Calling finish_interview confirms the profile for matching automatically.`;
 }
 
 function formatField(key: string, value: string | number) {
@@ -246,6 +276,11 @@ function safeTranscript(transcriptJson: string): TranscriptLine[] {
   } catch {
     return [];
   }
+}
+
+function sourceLabel(source: ProfileFacts[string]["source"]) {
+  if (source === "public_web") return "public source";
+  return source.replaceAll("_", " ");
 }
 
 function mergeTranscriptChunk(current: string, chunk: string) {
@@ -308,6 +343,7 @@ export default function BrokerDesk() {
   const participantDraftRef = useRef("");
   const agentDraftRef = useRef("");
   const audioOutputReceivedRef = useRef(false);
+  const finalizedRef = useRef(false);
 
   const selected = participants.find((participant) => participant.id === selectedId) ?? null;
   const matches = useMemo(() => computeMatches(participants), [participants]);
@@ -455,10 +491,13 @@ export default function BrokerDesk() {
     [],
   );
 
-  const setReview = useCallback(
+  const finalizeProfile = useCallback(
     async () => {
       const participantId = participantIdRef.current;
       if (!participantId) return { saved: false };
+      if (finalizedRef.current) {
+        return { saved: true, status: "confirmed", alreadyConfirmed: true };
+      }
       const result = await jsonFetch<{ participant: Participant }>(
         "/api/participants",
         {
@@ -467,15 +506,17 @@ export default function BrokerDesk() {
           body: JSON.stringify({
             id: participantId,
             role,
-            interviewStatus: "review",
+            interviewStatus: "confirmed",
           }),
         },
       );
+      finalizedRef.current = true;
       setParticipants((current) => [
         result.participant,
         ...current.filter((item) => item.id !== result.participant.id),
       ]);
-      return { saved: true, status: "review" };
+      setNotice("Profile accepted automatically and ready for matching.");
+      return { saved: true, status: "confirmed" };
     },
     [role],
   );
@@ -536,7 +577,7 @@ export default function BrokerDesk() {
         } else if (call.name === "record_inspection_observation") {
           response = await saveObservation(call.args ?? {});
         } else if (call.name === "finish_interview") {
-          response = await setReview();
+          response = await finalizeProfile();
         } else {
           response = { error: "Unknown tool" };
         }
@@ -630,6 +671,7 @@ export default function BrokerDesk() {
 
     const participantId = crypto.randomUUID();
     participantIdRef.current = participantId;
+    finalizedRef.current = false;
     setSelectedId(participantId);
     setTranscript([]);
     participantDraftRef.current = "";
@@ -689,7 +731,7 @@ export default function BrokerDesk() {
             },
           ],
           sessionResumption: {},
-          temperature: 0.35,
+          temperature: 0,
         },
       });
       sessionRef.current = session;
@@ -711,7 +753,7 @@ export default function BrokerDesk() {
       setLiveState("listening");
       startVisualFrames();
       session.sendRealtimeInput({
-        text: `Begin the ${role} intake now. Briefly introduce yourself as Relay, explain that you will save only what they explicitly tell you, then ask the first question. A live inspection frame is shared automatically when available. If you can see it, briefly confirm one concrete, non-diagnostic detail from the apiary scene.`,
+        text: `Begin now with this exact standardized opening and nothing before it: "Hi, I'm Relay. I'll ask the same ten questions we use in every ${role} intake and save only what you explicitly tell me. Question 1 of 10. ${INTERVIEW_SCRIPTS[role][0]}" A live inspection frame is shared automatically when available, but it must not change the script order.`,
       });
     } catch (error) {
       audio.close();
@@ -731,9 +773,9 @@ export default function BrokerDesk() {
     }
   }
 
-  async function stopInterview() {
+  async function stopInterview(skipFlush = false) {
     setLiveState("ending");
-    await flushTranscriptTurn();
+    if (!skipFlush) await flushTranscriptTurn();
     if (visualTimerRef.current) clearInterval(visualTimerRef.current);
     visualTimerRef.current = null;
     audioRef.current?.stopCapture();
@@ -756,6 +798,26 @@ export default function BrokerDesk() {
       setLiveState("idle");
       void loadData();
     }, 400);
+  }
+
+  async function finishAndMatch() {
+    try {
+      await flushTranscriptTurn();
+      const result = await finalizeProfile();
+      if (!result.saved) {
+        throw new Error("No active participant profile could be finalized.");
+      }
+      await stopInterview(true);
+      setActiveTab("matches");
+      window.requestAnimationFrame(() => window.scrollTo(0, 0));
+    } catch (error) {
+      setLiveState("listening");
+      setLiveError(
+        error instanceof Error
+          ? error.message
+          : "Could not finish and match this interview.",
+      );
+    }
   }
 
   async function confirmProfile(participant: Participant) {
@@ -967,6 +1029,12 @@ export default function BrokerDesk() {
               </button>
             </div>
 
+            <div className="standardized-intake">
+              <ClipboardCheck size={14} />
+              <span>Standardized intake</span>
+              <b>{INTERVIEW_SCRIPTS[role].length} questions · fixed order</b>
+            </div>
+
             <div className="duplex-health" aria-label="Live audio status">
               <span className={audioHealth.microphone ? "healthy" : ""}>
                 <Mic size={13} />
@@ -1030,11 +1098,11 @@ export default function BrokerDesk() {
                   Start {roleCopy(role).noun} interview
                 </button>
               ) : (
-                <button className="button end-call" onClick={() => void stopInterview()}>
-                  <MicOff size={17} /> End interview
+                <button className="button end-call" onClick={() => void finishAndMatch()}>
+                  <MicOff size={17} /> Finish &amp; match
                 </button>
               )}
-              <span>Microphone permission required</span>
+              <span>{live ? "Auto-accepts profile and opens matches" : "Microphone permission required"}</span>
             </div>
           </section>
 
@@ -1189,7 +1257,7 @@ function ProfilesView({
       <div className="page-heading">
         <span className="hero-kicker"><Users size={16} /> Participant ledger</span>
         <h1>Profiles with provenance,<br /><i>not marketplace theater.</i></h1>
-        <p>Every value below came from a recorded interview action. Drafts stay out of matching.</p>
+        <p>Interview facts and public-source leads stay visibly distinct. Drafts stay out of matching.</p>
       </div>
       {!participants.length ? (
         <div className="large-empty">
@@ -1214,7 +1282,9 @@ function ProfilesView({
                   <small>{participant.operationName || participant.role}</small>
                 </span>
                 <em className={`status ${participant.interviewStatus}`}>
-                  {participant.interviewStatus}
+                  {participant.interviewStatus === "sourced"
+                    ? "public source"
+                    : participant.interviewStatus}
                 </em>
                 <ChevronRight size={15} />
               </button>
@@ -1230,7 +1300,8 @@ function ProfilesView({
                 </div>
                 <span className={`status-card ${selected.interviewStatus}`}>
                   {selected.interviewStatus === "confirmed" && <BadgeCheck size={17} />}
-                  {selected.interviewStatus}
+                  {selected.interviewStatus === "sourced" && <Database size={17} />}
+                  {selected.interviewStatus === "sourced" ? "public source" : selected.interviewStatus}
                 </span>
               </div>
               <div className="profile-columns">
@@ -1243,7 +1314,17 @@ function ProfilesView({
                           <span>{PROFILE_LABELS[key] ?? key}</span>
                           <strong>{formatField(key, fact.value)}</strong>
                           <p>“{fact.evidence}”</p>
-                          <small><ShieldCheck size={12} /> {fact.source} · {fact.confidence}</small>
+                          <small>
+                            <ShieldCheck size={12} /> {sourceLabel(fact.source)} · {fact.confidence}
+                            {fact.sourceUrl && (
+                              <>
+                                {" · "}
+                                <a href={fact.sourceUrl} target="_blank" rel="noreferrer">
+                                  verify <ExternalLink size={10} />
+                                </a>
+                              </>
+                            )}
+                          </small>
                         </div>
                       ))}
                     </div>
@@ -1294,11 +1375,11 @@ function MatchesView({
   matches: MatchResult[];
   participants: Participant[];
 }) {
-  const confirmedKeepers = participants.filter(
-    (item) => item.role === "beekeeper" && item.interviewStatus === "confirmed",
+  const matchReadyKeepers = participants.filter(
+    (item) => item.role === "beekeeper" && isMatchEligible(item),
   ).length;
-  const confirmedGrowers = participants.filter(
-    (item) => item.role === "grower" && item.interviewStatus === "confirmed",
+  const matchReadyGrowers = participants.filter(
+    (item) => item.role === "grower" && isMatchEligible(item),
   ).length;
 
   return (
@@ -1306,20 +1387,20 @@ function MatchesView({
       <div className="page-heading match-heading">
         <span className="hero-kicker"><Handshake size={16} /> Pairing desk</span>
         <h1>Explain the fit.<br /><i>Expose what is still unknown.</i></h1>
-        <p>Scores use only confirmed profiles. Unknown information is shown—not guessed.</p>
+        <p>Scores use confirmed interviews and clearly labeled public-source leads. Unknown information is shown—not guessed.</p>
       </div>
       <div className="market-summary">
-        <div><Hexagon size={18} /><strong>{confirmedKeepers}</strong><span>confirmed beekeepers</span></div>
-        <div><Sprout size={18} /><strong>{confirmedGrowers}</strong><span>confirmed growers</span></div>
+        <div><Hexagon size={18} /><strong>{matchReadyKeepers}</strong><span>match-ready beekeepers</span></div>
+        <div><Sprout size={18} /><strong>{matchReadyGrowers}</strong><span>match-ready growers</span></div>
         <div><Handshake size={18} /><strong>{matches.length}</strong><span>reviewable pairings</span></div>
       </div>
       {!matches.length ? (
         <div className="large-empty">
           <Handshake size={30} />
-          <h2>A real match needs two confirmed sides</h2>
+          <h2>A match needs both sides</h2>
           <p>
-            Complete and confirm at least one beekeeper interview and one grower
-            interview. Relay will not populate fake listings for the demo.
+            Finish one interview. Relay will pair it with a verified,
+            public-source lead while keeping unknown commercial terms visible.
           </p>
         </div>
       ) : (

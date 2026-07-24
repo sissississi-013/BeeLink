@@ -1,6 +1,7 @@
 import { desc, eq } from "drizzle-orm";
 import { getDb } from "@/db";
 import { ensureSchema } from "@/db/ensure";
+import { ensurePublicProfiles } from "@/db/public-profiles";
 import { participants } from "@/db/schema";
 import { PROFILE_FIELDS, type ProfileFacts } from "@/lib/domain";
 
@@ -16,6 +17,7 @@ function messageFor(error: unknown) {
 export async function GET() {
   try {
     await ensureSchema();
+    await ensurePublicProfiles();
     const db = getDb();
     const rows = await db
       .select()

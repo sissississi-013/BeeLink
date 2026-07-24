@@ -1075,6 +1075,11 @@ button {
   color: #316147;
 }
 
+.status.sourced {
+  background: #dfe8ef;
+  color: #315a70;
+}
+
 .profile-detail {
   padding: 26px;
 }
@@ -1110,6 +1115,12 @@ button {
   background: #e2eee5;
   border-color: #c8ddcd;
   color: #356d4b;
+}
+
+.status-card.sourced {
+  background: #e7eff4;
+  border-color: #cadce7;
+  color: #315f78;
 }
 
 .profile-columns {
@@ -1172,6 +1183,16 @@ button {
   display: flex;
   font-size: 8px;
   gap: 4px;
+}
+
+.detail-facts small a {
+  align-items: center;
+  color: inherit;
+  display: inline-flex;
+  font-weight: 800;
+  gap: 3px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .evidence-list > div {
@@ -2207,6 +2228,26 @@ button.brand {
 }
 
 .compact-role-switch .share-scene {
+  margin-left: auto;
+}
+
+.standardized-intake {
+  align-items: center;
+  color: rgba(255, 255, 255, 0.62);
+  display: flex;
+  font-size: 9px;
+  gap: 6px;
+  padding: 8px 12px 0;
+}
+
+.standardized-intake span {
+  color: var(--honey-light);
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.standardized-intake b {
+  font-weight: 600;
   margin-left: auto;
 }
 

@@ -1,5 +1,5 @@
 export type ParticipantRole = "beekeeper" | "grower";
-export type InterviewStatus = "draft" | "review" | "confirmed";
+export type InterviewStatus = "draft" | "review" | "confirmed" | "sourced";
 
 export type TranscriptLine = {
   speaker: "participant" | "agent";
@@ -9,7 +9,8 @@ export type TranscriptLine = {
 
 export type SourcedFact = {
   value: string | number;
-  source: "live_interview" | "inspection" | "document";
+  source: "live_interview" | "inspection" | "document" | "public_web";
+  sourceUrl?: string;
   evidence: string;
   confidence: "low" | "medium" | "high";
   capturedAt: string;
@@ -60,6 +61,13 @@ export type MatchResult = {
   unresolved: string[];
 };
 
+export function isMatchEligible(participant: Participant) {
+  return (
+    participant.interviewStatus === "confirmed" ||
+    participant.interviewStatus === "sourced"
+  );
+}
+
 function parseDate(value: string | null) {
   if (!value) return null;
   const parsed = new Date(`${value}T00:00:00`);
@@ -83,12 +91,12 @@ export function computeMatches(participants: Participant[]): MatchResult[] {
   const keepers = participants.filter(
     (participant) =>
       participant.role === "beekeeper" &&
-      participant.interviewStatus === "confirmed",
+      isMatchEligible(participant),
   );
   const growers = participants.filter(
     (participant) =>
       participant.role === "grower" &&
-      participant.interviewStatus === "confirmed",
+      isMatchEligible(participant),
   );
 
   return keepers

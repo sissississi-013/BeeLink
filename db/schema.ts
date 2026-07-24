@@ -20,7 +20,7 @@ export const participants = sqliteTable("participants", {
   profileJson: text("profile_json").notNull().default("{}"),
   transcriptJson: text("transcript_json").notNull().default("[]"),
   interviewStatus: text("interview_status", {
-    enum: ["draft", "review", "confirmed"],
+    enum: ["draft", "review", "confirmed", "sourced"],
   })
     .notNull()
     .default("draft"),
